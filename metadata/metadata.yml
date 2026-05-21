@@ -1,5 +1,5 @@
 metadata_version: 1
-name: aind-ophys-extraction
+name: aind-ophys-extraction-kd
 description: This capsule uses a mix-and-match approach to combine Cellpose, Suite2p,
   and CaImAn for cell detection and signal extraction.
 authors:
