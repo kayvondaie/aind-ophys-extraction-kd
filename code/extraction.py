@@ -1616,6 +1616,47 @@ if __name__ == "__main__":
                 shutil.copy(str(f), str(output_dir / f.name))
                 print(f"DEBUG: copied {f.name}")
 
+    # Per-epoch suite2p output split (BCI / spont_pre / spont_post / ...).
+    # The bergamo_segmentation step concatenates non-photostim epochs in
+    # `valid_epoch_stems` order before extraction, so we just slice the
+    # combined F/Fneu/spks by frame range from epoch_locations.json. ROI-level
+    # files (stat, iscell, ops, redcell) are per-ROI not per-frame -- copy as-is.
+    if suite2p_dirs and session != {} and "Bergamo" in session.get("rig_id", ""):
+        motion_dir = input_fn.parent
+        epoch_loc_fp = next(motion_dir.glob("epoch_locations.json"), None)
+        if epoch_loc_fp is not None:
+            with open(epoch_loc_fp, "r") as j:
+                epoch_locations = json.load(j)
+            valid_epoch_stems = [
+                i["output_parameters"]["tiff_stem"]
+                for i in session["stimulus_epochs"]
+                if i["stimulus_name"] != "2p photostimulation"
+            ]
+            s2p_plane0 = Path(suite2p_dirs[0])
+            F_all = np.load(s2p_plane0 / "F.npy") if (s2p_plane0 / "F.npy").exists() else None
+            Fneu_all = np.load(s2p_plane0 / "Fneu.npy") if (s2p_plane0 / "Fneu.npy").exists() else None
+            spks_all = np.load(s2p_plane0 / "spks.npy") if (s2p_plane0 / "spks.npy").exists() else None
+            roi_files = [n for n in ("stat.npy", "iscell.npy", "ops.npy", "redcell.npy")
+                         if (s2p_plane0 / n).exists()]
+            offset = 0
+            for stem in valid_epoch_stems:
+                loc = epoch_locations.get(stem)
+                if loc is None:
+                    print(f"DEBUG: no epoch_locations entry for stem '{stem}', skipping")
+                    continue
+                length = loc[1] - loc[0] + 1
+                epoch_dir = output_dir / f"suite2p_{stem}" / "plane0"
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                if F_all is not None:
+                    np.save(epoch_dir / "F.npy", F_all[:, offset:offset + length])
+                if Fneu_all is not None:
+                    np.save(epoch_dir / "Fneu.npy", Fneu_all[:, offset:offset + length])
+                if spks_all is not None:
+                    np.save(epoch_dir / "spks.npy", spks_all[:, offset:offset + length])
+                for rf in roi_files:
+                    shutil.copy(str(s2p_plane0 / rf), str(epoch_dir / rf))
+                print(f"DEBUG: wrote suite2p_{stem}/plane0 (frames {offset}:{offset + length}, {length} frames)")
+                offset += length
 
     # create a video overlaid wit ROI contours
     if args.contour_video:
