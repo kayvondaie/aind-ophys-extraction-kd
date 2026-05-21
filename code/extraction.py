@@ -319,9 +319,14 @@ def get_metadata(input_dir: Path) -> Tuple[dict, dict, dict]:
     data_des_fp = next(input_dir.rglob("data_description.json"))
     with open(data_des_fp, "r") as j:
         data_description = json.load(j)
-    subject_fp = next(input_dir.rglob("subject.json"))
-    with open(subject_fp, "r") as j:
-        subject = json.load(j)
+    # subject.json isn't always piped into /data by the pipeline; fall back to
+    # session.json's subject_id since that's the only field actually used.
+    try:
+        subject_fp = next(input_dir.rglob("subject.json"))
+        with open(subject_fp, "r") as j:
+            subject = json.load(j)
+    except StopIteration:
+        subject = {"subject_id": session.get("subject_id", "")}
 
     return session, data_description, subject
 
