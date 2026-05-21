@@ -18,7 +18,6 @@ import sparse
 import suite2p
 from aind_data_schema.core.processing import DataProcess, ProcessName
 from aind_data_schema.core.quality_control import QCMetric, QCStatus, Status
-from aind_log_utils.log import setup_logging
 from aind_ophys_utils.array_utils import downsample_array
 from aind_ophys_utils.summary_images import (max_corr_image, max_image,
                                              mean_image)
@@ -56,7 +55,7 @@ class ExtractionSettings(BaseSettings, cli_parse_args=True):
         ),
     )
     init: str = Field(
-        default="mean",
+        default="sparsery",
         description=(
             "Initialization method for finding masks. Options: "
             "max/mean: Cellpose on max projection image divided by mean image; "
@@ -73,8 +72,8 @@ class ExtractionSettings(BaseSettings, cli_parse_args=True):
         default=1,
         description="this channel is used to extract functional ROIs (1-based)",
     )
-    threshold_scaling: int = Field(
-        default=1,
+    threshold_scaling: float = Field(
+        default=0.7,
         description="adjust the automatically determined threshold by this scalar multiplier",
     )
     max_overlap: float = Field(
@@ -82,7 +81,7 @@ class ExtractionSettings(BaseSettings, cli_parse_args=True):
         description="cells with more overlap than this get removed during triage, before refinement",
     )
     soma_crop: bool = Field(
-        default=False,
+        default=True,
         description="crop dendrites for cell classification stats like compactness",
     )
     allow_overlap: bool = Field(
@@ -1336,7 +1335,6 @@ if __name__ == "__main__":
         session, data_description, subject = {}, {}, {}
     subject_id = subject.get("subject_id", "")
     name = data_description.get("name", "")
-    setup_logging("aind-ophys-extraction", subject_id=subject_id, asset_name=name)
     if next(input_dir.rglob("*decrosstalk.h5"), ""):
         input_fn = next(input_dir.rglob("*decrosstalk.h5"))
     else:
@@ -1402,7 +1400,8 @@ if __name__ == "__main__":
         suite2p_args["denoise"] = args.denoise
         suite2p_args["save_path0"] = str(tmp_dir)
         suite2p_args["functional_chan"] = args.functional_chan
-        suite2p_args["threshold_scaling"] = args.threshold_scaling
+        suite2p_args["threshold_scaling"] = 0.7  # hardcoded to match local pipeline; ignores CLI/env override
+        suite2p_args["smooth_sigma"] = 0.5
         suite2p_args["max_overlap"] = args.max_overlap
         suite2p_args["soma_crop"] = args.soma_crop
         suite2p_args["allow_overlap"] = args.allow_overlap
@@ -1410,12 +1409,13 @@ if __name__ == "__main__":
         # processing pipeline. These are parameters that are not exposed to
         # minimize code length. Those are not set to default.
         suite2p_args["sparse_mode"] = args.init == "sparsery"
+        suite2p_args["nonrigid"] = False
         suite2p_args["h5py"] = str(motion_corrected_fn)
         suite2p_args["data_path"] = []
         suite2p_args["roidetect"] = True
         suite2p_args["do_registration"] = 0
         suite2p_args["spikedetect"] = False
-        suite2p_args["fs"] = frame_rate
+        suite2p_args["fs"] = 20  # hardcoded to match local pipeline (actual metadata rate was ~58 Hz)
         suite2p_args["neuropil_extract"] = True
         # determine nbinned from bin_duration and fs
         # The duration of time (in seconds) that
@@ -1608,6 +1608,14 @@ if __name__ == "__main__":
     with h5py.File(str(motion_corrected_fn), "r") as f:
         corr_img = max_corr_image(f["data"])
     save_summary_images_with_rois(output_dir, unique_id, rois, iscell, ops, corr_img)
+    import shutil
+    suite2p_dirs = list(tmp_dir.rglob("plane0"))
+    if suite2p_dirs:
+        for f in Path(suite2p_dirs[0]).iterdir():
+            if f.suffix in ('.npy',):
+                shutil.copy(str(f), str(output_dir / f.name))
+                print(f"DEBUG: copied {f.name}")
+
 
     # create a video overlaid wit ROI contours
     if args.contour_video:

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Placeholder git-askpass to satisfy the Dockerfile COPY step.
+# CO normally injects a real one during its internal builds; for GitHub-sourced
+# capsules this stub is sufficient since nothing in the Dockerfile actually
+# invokes git over the network after the COPY.
+exit 0
