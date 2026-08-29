@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime as dt
 from multiprocessing.pool import Pool, ThreadPool
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import caiman
 import cv2
@@ -1312,6 +1314,97 @@ def contour_video(
     writer.close()
 
 
+# ---------------------------------------------------------------------------
+# Dual-channel dispatcher.
+#
+# Motion-correction (aind-ophys-motion-correction) writes per-channel outputs
+# under `chan1/`, `chan2/` subdirectories of its output dir when a bergamo
+# session was dual-channel. When those subdirectories are present in this
+# capsule's input dir, we run extraction once per channel via subprocess
+# (each subprocess sees only that channel's data), so ROI detection and
+# trace extraction happen independently per channel -- matching the local
+# kd_suite2p_use_old_rois_two_channels pattern (green axons and red cell
+# bodies segmented as different objects).
+# ---------------------------------------------------------------------------
+def _find_channel_subdirs(input_dir: Path) -> List[Path]:
+    """Return per-channel subdirs (chan1, chan2, ...) if present, else []."""
+    return sorted(
+        p for p in input_dir.iterdir()
+        if p.is_dir() and re.match(r"^chan\d+$", p.name)
+    )
+
+
+def _override_cli_args(argv: List[str], overrides: dict) -> List[str]:
+    """Rebuild argv with `overrides` replacing any --key or --key= values."""
+    keys_to_strip = set()
+    for k in overrides:
+        keys_to_strip.add(f"--{k}")
+        keys_to_strip.add(f"--{k.replace('_', '-')}")
+    out: List[str] = []
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in keys_to_strip:
+            skip_next = True
+            continue
+        if any(tok.startswith(f"{k}=") for k in keys_to_strip):
+            continue
+        out.append(tok)
+    for k, v in overrides.items():
+        out.extend([f"--{k}", str(v)])
+    return out
+
+
+def _dispatch_per_channel_subprocesses(
+    orig_argv: List[str], input_dir: Path, output_dir: Path, chan_dirs: List[Path]
+) -> int:
+    """Re-invoke this script per channel; return the max nonzero exit code."""
+    import shutil
+    script_path = Path(__file__).resolve()
+    max_rc = 0
+    for chan_dir in chan_dirs:
+        chan_name = chan_dir.name  # e.g. "chan1", "chan2"
+        chan_output = (output_dir / chan_name).resolve()
+        chan_output.mkdir(parents=True, exist_ok=True)
+
+        # Extraction's get_metadata() rglobs for session.json /
+        # data_description.json / subject.json under input_dir. Symlink these
+        # from the parent input_dir into the chan subdir so the subprocess
+        # (which sees input_dir=chan_dir) finds them.
+        for sidecar_name in ("session.json", "data_description.json", "subject.json"):
+            for src in input_dir.rglob(sidecar_name):
+                if chan_dir in src.parents:
+                    break  # already inside chan_dir, no symlink needed
+                dst = chan_dir / src.name
+                if dst.exists() or dst.is_symlink():
+                    try:
+                        dst.unlink()
+                    except OSError:
+                        pass
+                try:
+                    dst.symlink_to(src.resolve())
+                except OSError:
+                    shutil.copy(src, dst)
+                break  # first hit only
+
+        new_argv = _override_cli_args(
+            orig_argv,
+            {"input_dir": str(chan_dir), "output_dir": str(chan_output)},
+        )
+        cmd = [sys.executable, str(script_path)] + new_argv
+        logging.info(
+            f"[dual-channel] launching extraction subprocess for {chan_name}: "
+            f"{' '.join(cmd)}"
+        )
+        rc = subprocess.call(cmd)
+        logging.info(f"[dual-channel] {chan_name} exit code = {rc}")
+        if rc != 0:
+            max_rc = max(max_rc, rc)
+    return max_rc
+
+
 if __name__ == "__main__":
     start_time = dt.now()
     # Parse command-line arguments
@@ -1334,6 +1427,26 @@ if __name__ == "__main__":
     if next(input_dir.glob("output"), ""):
         sys.exit()
     tmp_dir = args.tmp_dir.resolve()
+
+    # === DUAL-CHANNEL DISPATCHER ==========================================
+    # If the input has chan1/, chan2/ subdirs (from dual-channel
+    # motion-correction), run this script once per subdir via subprocess.
+    # AIND_EXT_DUAL_CHAN_ACTIVE breaks recursion.
+    _in_dual_sub = os.environ.get("AIND_EXT_DUAL_CHAN_ACTIVE") == "1"
+    if not _in_dual_sub:
+        _chan_dirs = _find_channel_subdirs(input_dir)
+        if _chan_dirs:
+            logger.info(
+                f"Dual-channel input detected ({[c.name for c in _chan_dirs]}); "
+                f"dispatching extraction per channel"
+            )
+            os.environ["AIND_EXT_DUAL_CHAN_ACTIVE"] = "1"
+            _rc = _dispatch_per_channel_subprocesses(
+                sys.argv[1:], input_dir, output_dir, _chan_dirs
+            )
+            sys.exit(_rc)
+    # === END DUAL-CHANNEL DISPATCHER =======================================
+
     try:
         session, data_description, subject = get_metadata(input_dir)
     except StopIteration:
