@@ -1621,30 +1621,78 @@ if __name__ == "__main__":
                 shutil.copy(str(f), str(output_dir / f.name))
                 print(f"DEBUG: copied {f.name}")
 
-    # Per-epoch suite2p output split (BCI / spont_pre / spont_post / ...).
-    # The bergamo_segmentation step concatenates non-photostim epochs in
-    # `valid_epoch_stems` order before extraction, so we just slice the
-    # combined F/Fneu/spks by frame range from epoch_locations.json. ROI-level
-    # files (stat, iscell, ops, redcell) are per-ROI not per-frame -- copy as-is.
+        # For Bergamo sessions, suite2p ran on the photostim-filtered movie
+        # (from bergamo_segmentation), so its F/Fneu on disk only cover
+        # non-photostim frames. Downstream consumers (explore.py,
+        # run_session.py) slice these files by epoch_locations frame ranges
+        # — which are indexed against the FULL concatenated movie. Overwrite
+        # with the full-frame traces from extraction_wrapper so those slices
+        # match epoch_locations for every epoch including photostim.
+        if session != {} and "Bergamo" in session.get("rig_id", ""):
+            try:
+                np.save(output_dir / "F.npy", np.asarray(traces_roi))
+                np.save(output_dir / "Fneu.npy", np.asarray(traces_neuropil))
+                print("DEBUG: overwrote F.npy / Fneu.npy with full-frame traces from extraction_wrapper")
+            except NameError:
+                # No in-memory traces (e.g. no ROIs found path); leave partial F/Fneu alone.
+                pass
+
+    # Per-epoch suite2p output split (BCI / spont_pre / spont_post / photostim / ...).
+    #
+    # For Bergamo, suite2p's on-disk F.npy/Fneu.npy in tmp_dir cover only the
+    # non-photostim frames (that's what bergamo_segmentation feeds to run_s2p).
+    # But `extraction_wrapper` above (run for Bergamo) re-extracts traces
+    # against the FULL _registered.h5, so `traces_roi` and `traces_neuropil`
+    # in memory span every frame in epoch_locations.json, in the movie's
+    # original concatenation order. Use those in-memory arrays so we can
+    # also emit suite2p_<photostim_stem>/ folders that downstream
+    # data_dict_create_module_bruker.py needs to build data['photostim'].
+    #
+    # spks.npy is only produced by run_s2p (segmentation input), so we can
+    # slice it for non-photostim epochs but must skip it for photostim.
+    # ROI-level files (stat, iscell, ops, redcell) are per-ROI not per-frame
+    # -- copy as-is into every per-epoch folder.
     if suite2p_dirs and session != {} and "Bergamo" in session.get("rig_id", ""):
         motion_dir = input_fn.parent
         epoch_loc_fp = next(motion_dir.glob("epoch_locations.json"), None)
         if epoch_loc_fp is not None:
             with open(epoch_loc_fp, "r") as j:
                 epoch_locations = json.load(j)
-            valid_epoch_stems = [
+
+            def _is_photostim(ep):
+                return "photostim" in ep.get("stimulus_name", "").lower()
+
+            all_epoch_stems = [
                 i["output_parameters"]["tiff_stem"]
                 for i in session["stimulus_epochs"]
-                if i["stimulus_name"] != "2p photostimulation"
             ]
+            photostim_stems = {
+                i["output_parameters"]["tiff_stem"]
+                for i in session["stimulus_epochs"]
+                if _is_photostim(i)
+            }
             s2p_plane0 = Path(suite2p_dirs[0])
-            F_all = np.load(s2p_plane0 / "F.npy") if (s2p_plane0 / "F.npy").exists() else None
-            Fneu_all = np.load(s2p_plane0 / "Fneu.npy") if (s2p_plane0 / "Fneu.npy").exists() else None
+
+            # Prefer full-length in-memory traces (Bergamo path always
+            # populates these via extraction_wrapper). Fall back to on-disk
+            # F.npy (partial coverage) only for the non-Bergamo case.
+            try:
+                F_all = np.asarray(traces_roi)
+                Fneu_all = np.asarray(traces_neuropil)
+                use_in_memory = True
+            except NameError:
+                F_all = np.load(s2p_plane0 / "F.npy") if (s2p_plane0 / "F.npy").exists() else None
+                Fneu_all = np.load(s2p_plane0 / "Fneu.npy") if (s2p_plane0 / "Fneu.npy").exists() else None
+                use_in_memory = False
             spks_all = np.load(s2p_plane0 / "spks.npy") if (s2p_plane0 / "spks.npy").exists() else None
             roi_files = [n for n in ("stat.npy", "iscell.npy", "ops.npy", "redcell.npy")
                          if (s2p_plane0 / n).exists()]
-            offset = 0
-            for stem in valid_epoch_stems:
+
+            # Non-photostim offset walks the concatenated-segmentation-input
+            # frames on disk (spks.npy dimension). In-memory F/Fneu are
+            # indexed directly by epoch_locations frame ranges.
+            nonstim_offset = 0
+            for stem in all_epoch_stems:
                 loc = epoch_locations.get(stem)
                 if loc is None:
                     print(f"DEBUG: no epoch_locations entry for stem '{stem}', skipping")
@@ -1652,16 +1700,26 @@ if __name__ == "__main__":
                 length = loc[1] - loc[0] + 1
                 epoch_dir = output_dir / f"suite2p_{stem}" / "plane0"
                 epoch_dir.mkdir(parents=True, exist_ok=True)
+                is_stim = stem in photostim_stems
                 if F_all is not None:
-                    np.save(epoch_dir / "F.npy", F_all[:, offset:offset + length])
+                    if use_in_memory:
+                        np.save(epoch_dir / "F.npy", F_all[:, loc[0]:loc[1] + 1])
+                    elif not is_stim:
+                        np.save(epoch_dir / "F.npy", F_all[:, nonstim_offset:nonstim_offset + length])
                 if Fneu_all is not None:
-                    np.save(epoch_dir / "Fneu.npy", Fneu_all[:, offset:offset + length])
-                if spks_all is not None:
-                    np.save(epoch_dir / "spks.npy", spks_all[:, offset:offset + length])
+                    if use_in_memory:
+                        np.save(epoch_dir / "Fneu.npy", Fneu_all[:, loc[0]:loc[1] + 1])
+                    elif not is_stim:
+                        np.save(epoch_dir / "Fneu.npy", Fneu_all[:, nonstim_offset:nonstim_offset + length])
+                if spks_all is not None and not is_stim:
+                    np.save(epoch_dir / "spks.npy", spks_all[:, nonstim_offset:nonstim_offset + length])
                 for rf in roi_files:
                     shutil.copy(str(s2p_plane0 / rf), str(epoch_dir / rf))
-                print(f"DEBUG: wrote suite2p_{stem}/plane0 (frames {offset}:{offset + length}, {length} frames)")
-                offset += length
+                tag = " (photostim)" if is_stim else ""
+                print(f"DEBUG: wrote suite2p_{stem}/plane0{tag} "
+                      f"(frames {loc[0]}:{loc[1] + 1}, {length} frames)")
+                if not is_stim:
+                    nonstim_offset += length
 
     # create a video overlaid wit ROI contours
     if args.contour_video:
